@@ -1,9 +1,8 @@
-#include <stdio.h>
 #include "err.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -11,12 +10,6 @@
 #include <ctype.h>
 
 #define BUFFER_SIZE 4096
-
-// todo: no TE
-// todo: chunked extension
-// todo: no port
-// todo: cookie end
-// todo: error http
 
 int connect_socket(const char *host, const char *port) {
   /* split host and port */
@@ -90,36 +83,43 @@ void append(char **dest, const char *src, unsigned *size, unsigned *current) {
   }
 }
 
+void add_cookies(char **message, FILE *file, unsigned *size, unsigned *current) {
+  char buffer[4096];
+  memset(buffer, 0, sizeof(buffer));
+  bool empty = 1;
+  while (fgets(buffer, sizeof(buffer), file)) {
+    if (empty) {
+      append(message, "Cookie: ", size, current);
+      empty = 0;
+    }
+    buffer[strlen(buffer) - 1] = ';';
+    buffer[strlen(buffer)] = ' ';
+    append(message, buffer, size, current);
+    memset(buffer, 0, sizeof(buffer));
+  }
+  append(message, "\r\n", size, current);
+}
+
 char *request(const char *cookies, const char *test, const char *host) {
   char *message = NULL;
   unsigned size = 0;
   unsigned current = 0;
+  /* append essential request headers */
   append(&message, "GET ", &size, &current);
   append(&message, test, &size, &current);
   append(&message, " HTTP/1.1\r\n\0", &size, &current);
   append(&message, "Host: ", &size, &current);
   append(&message, host, &size, &current);
   append(&message, "\r\n", &size, &current);
+  /* add cookies from given file */
   FILE *file = fopen(cookies, "r");
   if (file == NULL) {
     syserr("file opening");
   }
-  char buffer[4096];
-  memset(buffer, 0, sizeof(buffer));
-  bool empty = 1;
-  while (fgets(buffer, sizeof(buffer), file)) {
-    if (empty) {
-      append(&message, "Cookie: ", &size, &current);
-      empty = 0;
-    }
-    buffer[strlen(buffer) - 1] = ';';
-    buffer[strlen(buffer)] = ' ';
-    append(&message, buffer, &size, &current);
-    memset(buffer, 0, sizeof(buffer));
-  }
-  append(&message, "\r\n", &size, &current);
+  add_cookies(&message, file, &size, &current);
   append(&message, "Connection: close\r\n\0", &size, &current);
   append(&message, "\r\n", &size, &current);
+  /* erase extra part */
   for (unsigned i = current; i < size; i++) {
     message[i] = 0;
   }
@@ -150,7 +150,6 @@ bool ok_response(const char *line) {
 
 void check_for_cookie(const char *line) {
   if (is_n_equal(line, "Set-Cookie: ", strlen("Set-Cookie: "))) {
-    // todo: check check_cookie
     int i = strlen("Set-Cookie: ");
     while (i < strlen(line) - 2 && line[i] != ';') {
       putchar(line[i]);
@@ -178,24 +177,12 @@ void printline(const char *line) {
   putchar('\n');
 }
 
-int body_length(const char *line) {
-  int length;
-  if (sscanf(line, "Content-Length: %d", &length) != 0) {
-    return length;
-  }
-  return -1;
-}
-
-int chunked_length(int socked_fd, char *buffer2, int i, int n) {
+int chunked_length(int socked_fd, char *buffer, int i, int n) {
   char *current = NULL;
   unsigned size = 0;
   unsigned used = 0;
   int read_so_far = -1;
   int body_length = 0;
-  char buffer[BUFFER_SIZE];
-  for (int j = ++i; j < n; j++) {
-    buffer[j] = buffer2[j];
-  }
   do {
     if (n < 0) {
       syserr("reading from socket");
@@ -221,6 +208,18 @@ int chunked_length(int socked_fd, char *buffer2, int i, int n) {
   return body_length;
 }
 
+int non_chunked(int socked_fd, char *buffer) {
+  int n;
+  int length = 0;
+  while ((n = read(socked_fd, buffer, BUFFER_SIZE))) {
+    if (n < 0) {
+      syserr("reading from socket");
+    }
+    length += n;
+  }
+  return length;
+}
+
 bool parse_headers(int socket_fd, char **error, int *result) {
   char *current = NULL;
   char buffer[BUFFER_SIZE];
@@ -229,7 +228,7 @@ bool parse_headers(int socket_fd, char **error, int *result) {
   bool first_header = 1;
   bool enc_chunk = 0;
   bool headers_finish = 0;
-  int content_length = -1;
+  int content_length = 0;
   int n, i;
   memset(buffer, 0, sizeof(buffer));
   while (!headers_finish && (n = read(socket_fd, buffer, BUFFER_SIZE))) {
@@ -244,26 +243,22 @@ bool parse_headers(int socket_fd, char **error, int *result) {
           return false;
         }
         if (headers_end(current)) {
+          if (enc_chunk) {
+            content_length = chunked_length(socket_fd, buffer, i, n);
+          } else {
+            content_length = non_chunked(socket_fd, buffer) + (n - i - 1);
+          }
           headers_finish = 1;
           break;
         }
         enc_chunk |= chunked(current);
         check_for_cookie(current);
-        if (body_length(current) != -1) {
-          content_length = body_length(current);
-        }
         first_header = 0;
         free(current);
         current = NULL;
         size = used = 0;
       }
     }
-    if (!headers_finish) {
-      memset(buffer, 0, sizeof(buffer));
-    }
-  }
-  if (enc_chunk) {
-    content_length = chunked_length(socket_fd, buffer, i, n);
   }
   *result = content_length;
   free(current);
@@ -285,10 +280,15 @@ int main(int argc, char *argv[]) {
   if (argc != 4) {
     syserr("usage: %s <host>:<port> <cookies> <http address>", argv[0]);
   }
+  /* split host and port */
   char *split = malloc(strlen(argv[1]) + 1);
   strcpy(split, argv[1]);
   char *host = strtok(split, ":");
   char *port = strtok(NULL, ":");
+  if (port == NULL) {
+    syserr("no port specified");
+  }
+  /* prepare http request */
   char *message = request(argv[2], argv[3], host);
   int socket_fd = connect_socket(host, port);
   if (write(socket_fd, message, strlen(message)) < 0) {
@@ -296,6 +296,7 @@ int main(int argc, char *argv[]) {
   }
   free(message);
   free(split);
+  /* response is ready */
   response(socket_fd);
   close(socket_fd);
   return 0;

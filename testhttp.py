@@ -1,4 +1,3 @@
-import subprocess
 import sys
 import time
 import urllib.parse
@@ -18,11 +17,13 @@ def call_raw():
 
 
 def https():
+    # parse host and port
     host = parsed.hostname
     port = parsed.port
     if port is None:
         port = 443
     netloc = host + ':' + str(port)
+    # to kill process
     pid = "pid = " + os.path.abspath(os.getcwd()) + "/pid.info\n"
     file = open("stunnel.config", "w")
     file.write(pid)
@@ -30,13 +31,13 @@ def https():
     file.write("connect = " + netloc)
     netloc = "127.0.0.1:3333"
     file.close()
-    os.system("sudo stunnel stunnel.config")
+    os.system("stunnel stunnel.config")
     time.sleep(2)
-    os.system("./cmake-build-debug/http_test " + netloc + " " + cookies + " " + tested_address)
+    os.system("./testhttp_raw " + netloc + " " + cookies + " " + tested_address)
     file = open("pid.info", "r")
     pid = file.read()
     file.close()
-    os.system("sudo kill " + pid)
+    os.system("kill " + pid)
     os.system("rm stunnel.config")
 
 

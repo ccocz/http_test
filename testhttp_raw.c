@@ -8,12 +8,18 @@
 #include <netinet/in.h>
 #include <netdb.h>
 #include <stdbool.h>
+#include <ctype.h>
 
 #define BUFFER_SIZE 4096
 
+// todo: no TE
+// todo: chunked extension
+// todo: no port
+// todo: cookie end
+// todo: error http
+
 int connect_socket(const char *host, const char *port) {
   /* split host and port */
-
   int sock;
   struct addrinfo addr_hints;
   struct addrinfo *addr_result;
@@ -43,38 +49,28 @@ int connect_socket(const char *host, const char *port) {
   return sock;
 }
 
-int connect_socket_old(const char *address) {
-  int socket_fd;
-  int portno;
-  int n;
-  struct sockaddr_in serv_addr;
-  struct hostent *server;
-  /* split host and port */
-  char *split = malloc(strlen(address) + 1);
-  strcpy(split, address);
-  char *host = strtok(split, ":");
-  char *port = strtok(NULL, ":");
-  portno = atoi(port);
-  /* open socket */
-  socket_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (socket_fd < 0) {
-    syserr("opening socket");
+bool is_equal(const char *a, const char *b) {
+  if (strlen(a) != strlen(b)) {
+    return 0;
   }
-  /* Takes a name as an argument and returns a pointer to a hostent containing information about that host. */
-  server = gethostbyname(host);
-  if (server == NULL) {
-    syserr("no such host");
+  for (int i = 0; i < strlen(a); i++) {
+    if (tolower(a[i]) != tolower(b[i])) {
+      return 0;
+    }
   }
-  /* configure address */
-  memset(&serv_addr, 0, sizeof(serv_addr));
-  serv_addr.sin_family = AF_INET;
-  memcpy((char *)server->h_addr, (char *)&serv_addr.sin_addr.s_addr, server->h_length);
-  serv_addr.sin_port = htons(portno);
-  /* connect socket to the address */
-  if (connect(socket_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0) {
-    syserr("connecting");
+  return 1;
+}
+
+bool is_n_equal(const char *a, const char *b, int n) {
+  if (strlen(a) < n || strlen(b) < n) {
+    return 0;
   }
-  return socket_fd;
+  for (int i = 0; i < n; i++) {
+    if (tolower(a[i]) != tolower(b[i])) {
+      return 0;
+    }
+  }
+  return 1;
 }
 
 void append(char **dest, const char *src, unsigned *size, unsigned *current) {
@@ -135,7 +131,7 @@ void add(const char c, char **current, unsigned *size, unsigned *used) {
     if (*size) {
       *size *= 2;
     } else {
-      *size = 1;
+      *size = 2;
     }
     *current = realloc(*current, *size);
   }
@@ -144,21 +140,17 @@ void add(const char c, char **current, unsigned *size, unsigned *used) {
   (*current)[*used] = '\0';
 }
 
-bool is_comlete(const char *line, const unsigned used) {
-  return line[used - 1] == '\n' && line[used - 2] == '\r';
+bool complete(const char *line, const unsigned used) {
+  return used >= 2 && line[used - 1] == '\n' && line[used - 2] == '\r';
 }
 
-bool is_ok(const char *line) {
-  return !strcmp(line, "HTTP/1.1 200 OK\r\n");
+bool ok_response(const char *line) {
+  return is_equal(line, "HTTP/1.1 200 OK\r\n");
 }
 
-void check_line(const char *line, bool *body) {
-  if (!strcmp(line, "\r\n")) {
-    *body = 1;
-    return;
-  }
-  if (!strncmp(line, "Set-Cookie: ", strlen("Set-Cookie: "))) {
-    // todo: check cookie
+void check_for_cookie(const char *line) {
+  if (is_n_equal(line, "Set-Cookie: ", strlen("Set-Cookie: "))) {
+    // todo: check check_cookie
     int i = strlen("Set-Cookie: ");
     while (i < strlen(line) - 2 && line[i] != ';') {
       putchar(line[i]);
@@ -166,6 +158,15 @@ void check_line(const char *line, bool *body) {
     }
     putchar('\n');
   }
+}
+
+bool headers_end(const char *line) {
+  return is_equal(line, "\r\n");
+}
+
+bool chunked(const char *line) {
+  return is_equal(line, "transfer-encoding: chunked\r\n")
+  || is_equal(line, "transfer-encoding:chunked\r\n");
 }
 
 void printline(const char *line) {
@@ -177,48 +178,107 @@ void printline(const char *line) {
   putchar('\n');
 }
 
-void response(int socket_fd) {
-  char buffer[BUFFER_SIZE];
-  memset(buffer, 0, sizeof(buffer));
-  int n;
+int body_length(const char *line) {
+  int length;
+  if (sscanf(line, "Content-Length: %d", &length) != 0) {
+    return length;
+  }
+  return -1;
+}
+
+int chunked_length(int socked_fd, char *buffer2, int i, int n) {
   char *current = NULL;
   unsigned size = 0;
   unsigned used = 0;
-  bool first_header = 1;
-  bool ok = 1;
-  bool body = 0;
-  int content_length = 0;
-  memset(buffer, 0, sizeof(buffer));
-  while (ok && (n = read(socket_fd, buffer, BUFFER_SIZE))) {
+  int read_so_far = -1;
+  int body_length = 0;
+  char buffer[BUFFER_SIZE];
+  for (int j = ++i; j < n; j++) {
+    buffer[j] = buffer2[j];
+  }
+  do {
     if (n < 0) {
       syserr("reading from socket");
     }
-    for (int i = 0; i < n; i++) {
-      if (body) {
-        content_length += n - i;
-        break;
+    for (; i < n; i++) {
+      if (read_so_far > 0) {
+        read_so_far--;
+        continue;
       }
       add(buffer[i], &current, &size, &used);
-      bool complete = is_comlete(current, used);
-      if (complete && first_header && !is_ok(current)) {
-        ok = 0;
-        printline(current);
+      if (complete(current, used)) {
+        int _size;
+        sscanf(current, "%x", &_size);
+        body_length += _size;
+        read_so_far = _size + 2;
         free(current);
-        break;
+        current = NULL;
+        size = used = 0;
       }
-      if (complete) {
-        check_line(current, &body);
+    }
+    i = 0;
+  } while ((n = read(socked_fd, buffer, BUFFER_SIZE)));
+  return body_length;
+}
+
+bool parse_headers(int socket_fd, char **error, int *result) {
+  char *current = NULL;
+  char buffer[BUFFER_SIZE];
+  unsigned size = 0;
+  unsigned used = 0;
+  bool first_header = 1;
+  bool enc_chunk = 0;
+  bool headers_finish = 0;
+  int content_length = -1;
+  int n, i;
+  memset(buffer, 0, sizeof(buffer));
+  while (!headers_finish && (n = read(socket_fd, buffer, BUFFER_SIZE))) {
+    if (n < 0) {
+      syserr("reading from socket");
+    }
+    for (i = 0; i < n; i++) {
+      add(buffer[i], &current, &size, &used);
+      if (complete(current, used)) {
+        if (first_header && !ok_response(current)) {
+          *error = current;
+          return false;
+        }
+        if (headers_end(current)) {
+          headers_finish = 1;
+          break;
+        }
+        enc_chunk |= chunked(current);
+        check_for_cookie(current);
+        if (body_length(current) != -1) {
+          content_length = body_length(current);
+        }
         first_header = 0;
         free(current);
         current = NULL;
         size = used = 0;
       }
     }
-    memset(buffer, 0, sizeof(buffer));
+    if (!headers_finish) {
+      memset(buffer, 0, sizeof(buffer));
+    }
   }
-  if (ok) {
-    printf("Dlugosc zasobu: %d\n", content_length);
+  if (enc_chunk) {
+    content_length = chunked_length(socket_fd, buffer, i, n);
   }
+  *result = content_length;
+  free(current);
+  return 1;
+}
+
+void response(int socket_fd) {
+  char *error;
+  int result;
+  if (!parse_headers(socket_fd, &error, &result)) {
+    printline(error);
+    free(error);
+    return;
+  }
+  printf("Dlugosc zasobu: %d\n", result);
 }
 
 int main(int argc, char *argv[]) {
